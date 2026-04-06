@@ -1,25 +1,34 @@
 #!/usr/bin/env node
+import WebSocket from "ws";
+import { randomUUID } from "node:crypto";
 /**
- * CDPBrowser MCP Server
+ * CDPBrowser MCP Server (Streamable HTTP Transport)
  *
- * Wraps browser-autopilot's CDPBrowser in an MCP server for Claude Code.
+ * Wraps browser-autopilot's CDPBrowser in an MCP server.
  * Uses Chrome's Accessibility API for DOM indexing — produces ~1.7K tokens
  * per page snapshot vs ~14K tokens from Playwright MCP (8.5x reduction).
+ *
+ * Runs as a persistent HTTP server — browser state, element maps, and CDP
+ * sessions survive across tool calls. This enables dialog handling, eliminates
+ * per-call element map rebuilds, and provides a cleaner architecture.
  *
  * Connect to an existing Chrome instance on CDP port 9222.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CDPBrowser } from "browser-autopilot";
+import express from "express";
 
 // ─── Config ──────────────────────────────────────────────────
 
 const CDP_URL = process.env.CDP_URL || "http://127.0.0.1:9222";
+const MCP_PORT = process.env.MCP_PORT ? parseInt(process.env.MCP_PORT, 10) : 8808;
 
 // ─── Browser Lifecycle ───────────────────────────────────────
 
@@ -37,6 +46,27 @@ async function ensureBrowser() {
   }
   browser = new CDPBrowser();
   await browser.connect(CDP_URL);
+
+  // Auto-accept beforeunload dialogs to prevent navigation blocking.
+  // The CDPBrowser already registers Page.javascriptDialogOpening and
+  // pushes to _dialogQueue. We hook into the CDP session directly to
+  // auto-accept 'beforeunload' type dialogs immediately.
+  try {
+    const cdp = browser.cdp || browser._cdp || browser.client;
+    if (cdp && cdp.Page) {
+      const originalHandler = cdp.Page._events?.javascriptDialogOpening;
+      cdp.Page.javascriptDialogOpening((params) => {
+        if (params.type === 'beforeunload') {
+          console.error('[cdp-browser] Auto-accepting beforeunload dialog');
+          cdp.Page.handleJavaScriptDialog({ accept: true }).catch(() => {});
+        }
+      });
+      console.error('[cdp-browser] Beforeunload auto-accept handler registered');
+    }
+  } catch (e) {
+    console.error('[cdp-browser] Warning: could not register beforeunload handler:', e.message);
+  }
+
   return browser;
 }
 
@@ -172,8 +202,9 @@ const TOOLS = [
       required: ["index"],
     },
     handler: async ({ index }) => {
+      const numIndex = typeof index === 'string' ? parseInt(index, 10) : index;
       const b = await ensureBrowser();
-      await b.clickByIndex(index);
+      await b.clickByIndex(numIndex);
       await b.waitMs(500);
       return textResult(await getSnapshot());
     },
@@ -200,8 +231,9 @@ const TOOLS = [
       required: ["index", "text"],
     },
     handler: async ({ index, text, clear = true }) => {
+      const numIndex = typeof index === 'string' ? parseInt(index, 10) : index;
       const b = await ensureBrowser();
-      await b.inputByIndex(index, text, clear);
+      await b.inputByIndex(numIndex, text, clear);
       await b.waitMs(300);
       return textResult(await getSnapshot());
     },
@@ -357,9 +389,18 @@ const TOOLS = [
       required: ["accept"],
     },
     handler: async ({ accept, text }) => {
-      const b = await ensureBrowser();
-      await b.handleDialog(accept, text);
-      return textResult(accept ? "Dialog accepted." : "Dialog dismissed.");
+      // With persistent HTTP transport, the browser object and its CDP session
+      // persist across tool calls. The Page.javascriptDialogOpening event is
+      // received by THIS session, so handleDialog works directly.
+      if (!browser) {
+        return textResult("Error: No browser connection. Call any other tool first to establish connection.");
+      }
+      try {
+        await browser.handleDialog(Boolean(accept), text !== undefined ? String(text) : undefined);
+        return textResult(accept ? "Dialog accepted." : "Dialog dismissed.");
+      } catch (err) {
+        return textResult(`Error handling dialog: ${err.message}`);
+      }
     },
   },
   {
@@ -418,8 +459,9 @@ const TOOLS = [
       required: ["index"],
     },
     handler: async ({ index, inner }) => {
+      const numIndex = typeof index === 'string' ? parseInt(index, 10) : index;
       const b = await ensureBrowser();
-      const html = await b.getElementHtml(index, inner);
+      const html = await b.getElementHtml(numIndex, inner);
       return textResult(html);
     },
   },
@@ -427,32 +469,140 @@ const TOOLS = [
 
 // ─── Server Setup ────────────────────────────────────────────
 
-const server = new Server(
-  { name: "cdp-browser", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+function createServer() {
+  const server = new Server(
+    { name: "cdp-browser", version: "1.1.0" },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS.map((t) => ({
-    name: t.name,
-    description: t.description,
-    inputSchema: t.inputSchema,
-  })),
-}));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: TOOLS.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    })),
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const tool = TOOLS.find((t) => t.name === request.params.name);
-  if (!tool) {
-    return textResult(`Unknown tool: ${request.params.name}`);
-  }
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const tool = TOOLS.find((t) => t.name === request.params.name);
+    if (!tool) {
+      return textResult(`Unknown tool: ${request.params.name}`);
+    }
+    try {
+      return await tool.handler(request.params.arguments || {});
+    } catch (err) {
+      return textResult(`Error in ${tool.name}: ${err.message}`);
+    }
+  });
+
+  return server;
+}
+
+// ─── Streamable HTTP Transport ───────────────────────────────
+
+const app = express();
+app.use(express.json());
+
+// Map to store transports by session ID
+const transports = {};
+
+// MCP POST endpoint — handles initialization and tool calls
+app.post("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+
   try {
-    return await tool.handler(request.params.arguments || {});
-  } catch (err) {
-    return textResult(`Error in ${tool.name}: ${err.message}`);
+    let transport;
+
+    if (sessionId && transports[sessionId]) {
+      // Reuse existing transport
+      transport = transports[sessionId];
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      // New initialization request — create fresh Server + Transport per session
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          console.log(`[cdp-browser] Session initialized: ${sid}`);
+          transports[sid] = transport;
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid && transports[sid]) {
+          console.log(`[cdp-browser] Session closed: ${sid}`);
+          delete transports[sid];
+        }
+      };
+
+      // Each session gets its own Server instance, but shares the browser singleton
+      const server = createServer();
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    } else {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid session ID" },
+        id: null,
+      });
+      return;
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("[cdp-browser] Error handling request:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
   }
+});
+
+// Handle GET requests for SSE streams
+app.get("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  if (!sessionId || !transports[sessionId]) {
+    res.status(400).send("Invalid or missing session ID");
+    return;
+  }
+  await transports[sessionId].handleRequest(req, res);
+});
+
+// Handle DELETE requests for session termination
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  if (!sessionId || !transports[sessionId]) {
+    res.status(400).send("Invalid or missing session ID");
+    return;
+  }
+  await transports[sessionId].handleRequest(req, res);
 });
 
 // ─── Start ───────────────────────────────────────────────────
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+app.listen(MCP_PORT, () => {
+  console.log(`[cdp-browser] MCP Streamable HTTP Server listening on port ${MCP_PORT}`);
+  console.log(`[cdp-browser] Endpoint: http://localhost:${MCP_PORT}/mcp`);
+  console.log(`[cdp-browser] CDP target: ${CDP_URL}`);
+  console.log(`[cdp-browser] Browser state: persistent (singleton)`);
+});
+
+// Handle graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("[cdp-browser] Shutting down...");
+  for (const sid in transports) {
+    try {
+      await transports[sid].close();
+      delete transports[sid];
+    } catch (e) {
+      console.error(`[cdp-browser] Error closing session ${sid}:`, e);
+    }
+  }
+  if (browser) {
+    try { await browser.close(); } catch (e) { /* ignore */ }
+  }
+  process.exit(0);
+});
