@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import WebSocket from "ws";
 import { randomUUID } from "node:crypto";
 /**
  * CDPBrowser MCP Server (Streamable HTTP Transport)
