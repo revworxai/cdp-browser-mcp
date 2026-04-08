@@ -22,6 +22,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CDPBrowser } from "browser-autopilot";
+import CDP from "chrome-remote-interface";
 import express from "express";
 
 // ─── Config ──────────────────────────────────────────────────
@@ -340,8 +341,35 @@ const TOOLS = [
           return textResult(`Opened new tab ${id}. ${await getSnapshot()}`);
         }
         case "switch": {
+          // Fix: Target.activateTarget only brings tab to foreground visually.
+          // The CDP session remains attached to the original target.
+          // We must close the old client and reconnect to the new target.
+          const cdpPort = parseInt(new URL(CDP_URL).port || "9222");
+
+          // 1. Activate target visually
           await b.switchTab(tabId);
+
+          // 2. Close old CDP client
+          try { await b.client.close(); } catch (_) {}
+
+          // 3. Reconnect to the specific target
+          b.client = await CDP({ port: cdpPort, target: tabId });
+
+          // 4. Re-enable required domains
+          const { Page: P, DOM: D, Runtime: R, Network: N } = b.cdp;
+          await Promise.all([P.enable(), D.enable(), R.enable(), N.enable()]);
+
+          // 5. Re-register beforeunload auto-accept handler
+          P.javascriptDialogOpening((params) => {
+            if (params.type === 'beforeunload') {
+              console.error('[cdp-browser] Auto-accepting beforeunload dialog');
+              P.handleJavaScriptDialog({ accept: true }).catch(() => {});
+            }
+            b._dialogQueue.push({ type: params.type, message: params.message });
+          });
+
           await b.waitMs(500);
+          console.error(`[cdp-browser] Switched CDP session to target ${tabId}`);
           return textResult(await getSnapshot());
         }
         case "close": {
